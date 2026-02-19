@@ -1,8 +1,8 @@
 name: Daily Inventory Check
 on:
   schedule:
-    - cron: '0 6 * * *'  # 6 AM UTC daily
-  workflow_dispatch:     # Manual trigger button
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 jobs:
   check:
@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GH_TOKEN }}  # Critical: allows push back
+          token: ${{ secrets.GH_TOKEN }}
       
       - uses: actions/setup-python@v4
         with:
@@ -23,6 +23,12 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+      
+      - name: Upload Excel report
+        uses: actions/upload-artifact@v4
+        with:
+          name: inventory-report
+          path: CARERO_INVENTORY_*.xlsx
       
       - name: Commit updated state
         run: |
