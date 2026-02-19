@@ -1,0 +1,27 @@
+name: Daily Inventory Check
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Runs at 6 AM UTC (adjust timezone as needed)
+  workflow_dispatch:      # Manual trigger button in GitHub UI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install requests pandas openpyxl
+      - run: python carero_checker.py
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+      - name: Commit updated state
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add inventory_previous.csv || true
+          git commit -m "Update inventory state $(date +%Y-%m-%d)" || echo "No changes"
+          git push
