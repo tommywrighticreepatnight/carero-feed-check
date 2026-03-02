@@ -52,7 +52,7 @@ if not os.path.exists(MY_SKUS_FILE):
     print(f"MISSING: {MY_SKUS_FILE} not found")
     sys.exit(1)
 
-my_skus = pd.read_csv(MY_SKUS_FILE)["SKU"].astype(str).str.strip().str.upper().tolist()
+my_skus = pd.read_csv(MY_SKUS_FILE, encoding='utf-8-sig')["SKU"].astype(str).str.strip().str.upper().tolist()
 current = [i for i in items if i["sku"] in my_skus]
 
 if not current:
