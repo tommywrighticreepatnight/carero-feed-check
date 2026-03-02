@@ -16,49 +16,82 @@ RECIPIENT_EMAILS = [e.strip() for e in os.environ.get("RECIPIENT_EMAILS", "").sp
 print("Fetching DveDeti feed...")
 print(f"URL: {FEED_URL}")
 
-# Увеличиваем таймаут до 120 секунд + ретраи
+# Загрузка фида
 max_retries = 3
 timeout = 120
+xml = None
 
 for attempt in range(max_retries):
     try:
         print(f"Attempt {attempt + 1}/{max_retries}...")
         r = requests.get(FEED_URL, timeout=timeout)
         r.raise_for_status()
-        xml = r.content.decode('utf-8')
+        xml = r.content.decode('utf-8', errors='ignore')
         print(f"✓ Feed loaded ({len(xml) // 1024 // 1024} MB)")
         break
-    except requests.exceptions.Timeout:
-        print(f"Timeout on attempt {attempt + 1}")
-        if attempt == max_retries - 1:
-            print(f"FAILED: Feed timed out after {max_retries} attempts")
-            sys.exit(1)
     except Exception as e:
         print(f"Error on attempt {attempt + 1}: {e}")
         if attempt == max_retries - 1:
             print(f"FAILED to fetch feed after {max_retries} attempts")
             sys.exit(1)
 
-# ПАРСИМ ПО ТЕГУ <PRODUKT> (не <ZBOZI>!)
-items = []
-for match in re.finditer(r'<PRODUKT>(.*?)</PRODUKT>', xml, re.DOTALL):
-    item_xml = match.group(1)
-    kod = re.search(r'<KOD>(.*?)</KOD>', item_xml)
-    stock_txt = re.search(r'<POCETNASKLADE>(.*?)</POCETNASKLADE>', item_xml)
-    name = re.search(r'<NAZEV>(.*?)</NAZEV>', item_xml)
-    
-    if kod and stock_txt:
-        try:
-            stock = int(stock_txt.group(1))
-        except:
-            stock = 0
-        items.append({
-            "sku": kod.group(1).strip().upper(),
-            "stock": stock,
-            "name": name.group(1).strip() if name else "Unknown"
-        })
+# ОТЛАДКА: проверяем наличие твоих SKUs в сыром фиде
+print("\n🔍 DEBUG: Checking if your SKUs exist in feed...")
+sample_skus = ['MI06', 'MR03S', 'UG70100']
+for sku in sample_skus:
+    if sku in xml:
+        print(f"  ✓ SKU '{sku}' FOUND in feed")
+    else:
+        print(f"  ✗ SKU '{sku}' NOT FOUND in feed")
 
-print(f"Parsed {len(items)} products from feed")
+# ОТЛАДКА: ищем реальные теги в фиде
+print("\n🔍 DEBUG: Looking for product tags in first 10KB of feed...")
+sample = xml[:10000].lower()
+tags_found = []
+for tag in ['produkt', 'zbozi', 'item', 'product', 'kod', 'pocetnasklade']:
+    if tag in sample:
+        tags_found.append(tag)
+print(f"  Tags detected: {tags_found}")
+
+# ПАРСИМ БОЛЕЕ ГИБКО: ищем <KOD> напрямую внутри блоков
+items = []
+# Ищем все блоки между <KOD> и </KOD> с захватом соседних тегов
+for match in re.finditer(r'<KOD>([^<]+)</KOD>.*?<POCETNASKLADE>([^<]+)</POCETNASKLADE>.*?<NAZEV>([^<]+)</NAZEV>', xml, re.DOTALL | re.IGNORECASE):
+    try:
+        sku = match.group(1).strip().upper()
+        stock = int(match.group(2).strip())
+        name = match.group(3).strip()
+        items.append({"sku": sku, "stock": stock, "name": name})
+    except:
+        continue
+
+# Если не нашли — пробуем альтернативный паттерн
+if len(items) == 0:
+    print("Trying fallback parser...")
+    for match in re.finditer(r'<PRODUKT[^>]*>(.*?)</PRODUKT>', xml, re.DOTALL | re.IGNORECASE):
+        block = match.group(1)
+        kod = re.search(r'<KOD>([^<]+)</KOD>', block, re.IGNORECASE)
+        stock_txt = re.search(r'<POCETNASKLADE>([^<]+)</POCETNASKLADE>', block, re.IGNORECASE)
+        name = re.search(r'<NAZEV>([^<]+)</NAZEV>', block, re.IGNORECASE)
+        
+        if kod and stock_txt:
+            try:
+                stock = int(stock_txt.group(1).strip())
+                sku = kod.group(1).strip().upper()
+                items.append({
+                    "sku": sku,
+                    "stock": stock,
+                    "name": name.group(1).strip() if name else "Unknown"
+                })
+            except:
+                continue
+
+print(f"\nParsed {len(items)} products from feed")
+
+if len(items) == 0:
+    print("ERROR: No products parsed. Showing first 500 chars of feed for debugging:")
+    print(xml[:500])
+    sys.exit(1)
 
 # Загружаем твои SKU
 if not os.path.exists(MY_SKUS_FILE):
@@ -72,6 +105,7 @@ if not current:
     print("WARNING: No matching SKUs found")
     print(f"First 3 feed SKUs: {[i['sku'] for i in items[:3]]}")
     print(f"Your SKUs: {my_skus[:3]}")
+    print("\n💡 TIP: Check if your SKUs in my_skus.xlsx match the <KOD> values EXACTLY (case/spaces)")
     sys.exit(1)
 
 print(f"Tracking {len(current)} of your SKUs")
@@ -125,7 +159,7 @@ today = datetime.now().strftime("%Y%m%d")
 report_file = f"DVEDETI_INVENTORY_{today}.xlsx"
 df.to_excel(report_file, index=False)
 
-print(f"DONE. Report: {report_file}")
+print(f"\n✅ DONE. Report: {report_file}")
 print(f"Out of stock: {len([r for r in report if r['Alert Level'] == 'OUT OF STOCK'])}")
 print(f"Dangerous (<=3): {len([r for r in report if r['Alert Level'] == 'DANGEROUS'])}")
 
@@ -140,7 +174,8 @@ if new_out_of_stock and BREVO_API_KEY and RECIPIENT_EMAILS:
     body += f"\nFull report attached: {report_file}"
     
     try:
-        response = requests.post(
+        import requests as req
+        response = req.post(
             "https://api.brevo.com/v3/smtp/email",
             headers={
                 "api-key": BREVO_API_KEY,
