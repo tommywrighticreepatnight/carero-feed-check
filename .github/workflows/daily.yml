@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.11'
       
-      - run: pip install requests pandas openpyxl
+      - run: pip install requests pandas openpyxl gspread oauth2client
       
       - run: python feed_checker.py
         env:
