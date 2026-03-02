@@ -16,9 +16,9 @@ RECIPIENT_EMAILS = [e.strip() for e in os.environ.get("RECIPIENT_EMAILS", "").sp
 print("Fetching DveDeti feed...")
 print(f"URL: {FEED_URL}")
 
-# Увеличиваем таймаут до 120 секунд + добавляем ретраи
+# Увеличиваем таймаут до 120 секунд + ретраи
 max_retries = 3
-timeout = 120  # 2 минуты
+timeout = 120
 
 for attempt in range(max_retries):
     try:
@@ -26,7 +26,7 @@ for attempt in range(max_retries):
         r = requests.get(FEED_URL, timeout=timeout)
         r.raise_for_status()
         xml = r.content.decode('utf-8')
-        print(f"✓ Feed loaded successfully ({len(xml)} bytes)")
+        print(f"✓ Feed loaded ({len(xml) // 1024 // 1024} MB)")
         break
     except requests.exceptions.Timeout:
         print(f"Timeout on attempt {attempt + 1}")
@@ -39,9 +39,9 @@ for attempt in range(max_retries):
             print(f"FAILED to fetch feed after {max_retries} attempts")
             sys.exit(1)
 
-# Парсим фид
+# ПАРСИМ ПО ТЕГУ <PRODUKT> (не <ZBOZI>!)
 items = []
-for match in re.finditer(r'<ZBOZI>(.*?)</ZBOZI>', xml, re.DOTALL):
+for match in re.finditer(r'<PRODUKT>(.*?)</PRODUKT>', xml, re.DOTALL):
     item_xml = match.group(1)
     kod = re.search(r'<KOD>(.*?)</KOD>', item_xml)
     stock_txt = re.search(r'<POCETNASKLADE>(.*?)</POCETNASKLADE>', item_xml)
@@ -58,7 +58,7 @@ for match in re.finditer(r'<ZBOZI>(.*?)</ZBOZI>', xml, re.DOTALL):
             "name": name.group(1).strip() if name else "Unknown"
         })
 
-print(f"Parsed {len(items)} products")
+print(f"Parsed {len(items)} products from feed")
 
 # Загружаем твои SKU
 if not os.path.exists(MY_SKUS_FILE):
@@ -82,7 +82,7 @@ if os.path.exists("inventory_previous.csv"):
     prev_df = pd.read_csv("inventory_previous.csv")
     prev_dict = dict(zip(prev_df["sku"], prev_df["stock"]))
 
-# Собираем отчёт + ищем НОВЫЕ нулевые стоки
+# Собираем отчёт
 report = []
 new_out_of_stock = []
 new_warning = []
@@ -92,10 +92,9 @@ for item in current:
     change = item["stock"] - prev
     status = "RESTOCKED" if change > 0 else "SOLD" if change < 0 else "UNCHANGED"
     
-    # Определяем уровень алерта
     if item["stock"] <= CRITICAL_STOCK:
         alert = "OUT OF STOCK"
-        if prev > CRITICAL_STOCK:  # НОВЫЙ нулевой сток
+        if prev > CRITICAL_STOCK:
             new_out_of_stock.append(item)
     elif item["stock"] <= WARNING_STOCK:
         alert = "DANGEROUS"
@@ -114,7 +113,7 @@ for item in current:
         "Alert Level": alert
     })
 
-# Сохраняем состояние для завтра
+# Сохраняем состояние
 pd.DataFrame(current)[["sku", "stock"]].to_csv("inventory_previous.csv", index=False)
 
 # Генерируем Excel
@@ -130,7 +129,7 @@ print(f"DONE. Report: {report_file}")
 print(f"Out of stock: {len([r for r in report if r['Alert Level'] == 'OUT OF STOCK'])}")
 print(f"Dangerous (<=3): {len([r for r in report if r['Alert Level'] == 'DANGEROUS'])}")
 
-# ОТПРАВЛЯЕМ ПИСЬМО ТОЛЬКО ПРИ НОВЫХ НУЛЕВЫХ СТОКАХ (через Brevo)
+# Отправка письма через Brevo
 if new_out_of_stock and BREVO_API_KEY and RECIPIENT_EMAILS:
     subject = f"OUT OF STOCK ALERT - {len(new_out_of_stock)} products"
     body = f"Products that just ran out of stock ({today}):\n\n"
