@@ -1,20 +1,28 @@
 import requests
-import pandas as pd
 import re
 from datetime import datetime
 import os
 import sys
 import json
 
-# CONFIG
+# ========== КОНФИГУРАЦИЯ ==========
+# Твои SKUs — просто вставь сюда (значения из тега <KOD> фида)
+MY_SKUS = [
+    "MI06",
+    "MR03S",
+    "UG70100",
+    # Добавляй сюда новые через запятую
+    # "SKU1",
+    # "SKU2",
+]
+
 FEED_URL = "https://b2b.dvedeti.cz/36365?password=36365"
-MY_SKUS_FILE = "my_skus.csv"
 CRITICAL_STOCK = 0
 WARNING_STOCK = 3
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 RECIPIENT_EMAILS = [e.strip() for e in os.environ.get("RECIPIENT_EMAILS", "").split(",") if e.strip()]
 GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "YOUR_SHEET_ID_HERE")  # ← ЗАМЕНИ НА СВОЙ ID
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 print("Fetching DveDeti feed...")
 try:
@@ -27,7 +35,7 @@ except Exception as e:
     print(f"FAILED to fetch feed: {e}")
     sys.exit(1)
 
-# Парсим SHOPITEM
+# Парсим фид
 print("Parsing SHOPITEM elements...")
 items = []
 for match in re.finditer(r'<SHOPITEM>(.*?)</SHOPITEM>', xml_str, re.DOTALL):
@@ -45,20 +53,16 @@ for match in re.finditer(r'<SHOPITEM>(.*?)</SHOPITEM>', xml_str, re.DOTALL):
         except:
             continue
 
-print(f"Parsed {len(items)} products")
+print(f"Parsed {len(items)} products from feed")
 
-# Загружаем твои SKU
-if not os.path.exists(MY_SKUS_FILE):
-    print(f"MISSING: {MY_SKUS_FILE} not found")
-    sys.exit(1)
-
-my_skus = pd.read_csv(MY_SKUS_FILE, encoding='cp1252')["SKU"].astype(str).str.strip().str.upper().tolist()
-current = [i for i in items if i["sku"] in my_skus]
+# Фильтруем только твои SKUs
+my_skus_set = set([s.upper() for s in MY_SKUS])
+current = [i for i in items if i["sku"] in my_skus_set]
 
 if not current:
     print("WARNING: No matching SKUs found")
     print(f"First 3 feed SKUs: {[i['sku'] for i in items[:3]]}")
-    print(f"Your SKUs: {my_skus[:3]}")
+    print(f"Your SKUs: {MY_SKUS[:3]}")
     sys.exit(1)
 
 print(f"Tracking {len(current)} of your SKUs")
@@ -66,10 +70,16 @@ print(f"Tracking {len(current)} of your SKUs")
 # Загружаем предыдущее состояние из файла
 prev_dict = {}
 if os.path.exists("inventory_previous.csv"):
-    prev_df = pd.read_csv("inventory_previous.csv")
-    prev_dict = dict(zip(prev_df["sku"], prev_df["stock"]))
+    with open("inventory_previous.csv", "r", encoding="utf-8") as f:
+        for line in f:
+            if "," in line:
+                sku, stock = line.strip().split(",", 1)
+                try:
+                    prev_dict[sku] = int(stock)
+                except:
+                    pass
 
-# Собираем отчёт + помечаем НОВЫЕ нулевые стоки
+# Собираем отчёт
 report = []
 new_out_of_stock = []
 
@@ -80,7 +90,7 @@ for item in current:
     
     if item["stock"] <= CRITICAL_STOCK:
         if prev > CRITICAL_STOCK:
-            alert = "NEWLY OUT OF STOCK, CHECK NEEDED"  # ← КЛЮЧЕВАЯ СТРОКА
+            alert = "NEWLY OUT OF STOCK, CHECK NEEDED"
             new_out_of_stock.append(item)
         else:
             alert = "OUT OF STOCK"
@@ -101,7 +111,16 @@ for item in current:
     })
 
 # Сохраняем состояние для завтра
-pd.DataFrame(current)[["sku", "stock"]].to_csv("inventory_previous.csv", index=False)
+with open("inventory_previous.csv", "w", encoding="utf-8") as f:
+    f.write("sku,stock\n")
+    for item in current:
+        f.write(f"{item['sku']},{item['stock']}\n")
+
+print(f"\n✅ Inventory check complete")
+print(f"Total tracked: {len(current)}")
+print(f"Out of stock: {len([r for r in report if r['Alert Level'] == 'OUT OF STOCK'])}")
+print(f"Newly out of stock: {len(new_out_of_stock)}")
+print(f"Dangerous (<=3): {len([r for r in report if r['Alert Level'] == 'DANGEROUS'])}")
 
 # ОБНОВЛЯЕМ GOOGLE SHEETS
 if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
@@ -116,14 +135,12 @@ if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
         client = gspread.authorize(creds)
         sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
         
-        # Очищаем таблицу (кроме заголовков)
+        # Очищаем и пишем заголовки
         sheet.clear()
-        
-        # Записываем заголовки
         headers = ["SKU", "Product", "Current Stock", "Previous Stock", "Change", "Status", "Alert Level", "Last Updated"]
         sheet.append_row(headers)
         
-        # Записываем данные
+        # Пишем данные
         for row in report:
             sheet.append_row([
                 row["SKU"],
@@ -138,17 +155,18 @@ if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
         
         print(f"✓ Google Sheets updated ({len(report)} rows)")
         
-        # Выделяем красным строки с "NEWLY OUT OF STOCK"
         if new_out_of_stock:
-            print(f"⚠️ {len(new_out_of_stock)} items marked as 'NEWLY OUT OF STOCK, CHECK NEEDED'")
-            print("Open your sheet → sort by 'Alert Level' column to see them at top")
+            print(f"\n⚠️ {len(new_out_of_stock)} NEWLY OUT OF STOCK items:")
+            for item in new_out_of_stock:
+                print(f"   - {item['sku']}: {item['name']} (stock: {item['stock']})")
+            print("\nOpen your sheet → sort by 'Alert Level' to see them at top")
     
     except Exception as e:
         print(f"Google Sheets error: {e}")
 else:
-    print("WARNING: GOOGLE_SHEETS_CREDENTIALS or GOOGLE_SHEET_ID not set — skipping sheet update")
+    print("WARNING: Google Sheets credentials not set — skipping sheet update")
 
-# Отправка письма при новых нулевых стоках
+# ОТПРАВЛЯЕМ ПИСЬМО ПРИ НОВЫХ НУЛЕВЫХ СТОКАХ
 if new_out_of_stock and BREVO_API_KEY and RECIPIENT_EMAILS:
     subject = f"OUT OF STOCK ALERT - {len(new_out_of_stock)} products"
     body = f"Products that just ran out of stock ({datetime.now().strftime('%Y-%m-%d')}):\n\n"
@@ -171,8 +189,10 @@ if new_out_of_stock and BREVO_API_KEY and RECIPIENT_EMAILS:
             }
         )
         if response.status_code in [200, 201]:
-            print(f"Email sent to {len(RECIPIENT_EMAILS)} recipients")
+            print(f"✓ Email sent to {len(RECIPIENT_EMAILS)} recipients")
         else:
             print(f"Brevo failed: {response.status_code}")
     except Exception as e:
         print(f"Email error: {e}")
+elif not new_out_of_stock:
+    print("No new out-of-stock items — skipping email")
