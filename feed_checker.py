@@ -73,30 +73,52 @@ if not current:
 
 print(f"Tracking {len(current)} of your SKUs")
 
-# Загружаем предыдущее состояние
+# Загружаем предыдущее состояние ИЗ ТАБЛИЦЫ (не из файла!)
 prev_dict = {}
-if os.path.exists("inventory_previous.csv"):
-    with open("inventory_previous.csv", "r", encoding="utf-8") as f:
-        for line in f:
-            if "," in line:
-                sku, stock = line.strip().split(",", 1)
-                try:
-                    prev_dict[sku] = int(stock)
-                except:
-                    pass
+pending_actions_from_sheet = {}
 
-# Загружаем список активных действий (что ещё не сделано)
-pending_actions = {}
-if os.path.exists("pending_actions.csv"):
-    with open("pending_actions.csv", "r", encoding="utf-8") as f:
-        for line in f:
-            if "," in line:
-                parts = line.strip().split(",", 2)
-                if len(parts) == 3:
-                    sku, action_type, timestamp = parts
-                    pending_actions[sku] = {"action": action_type, "since": timestamp}
+if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+        
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        
+        # Читаем предыдущие данные из таблицы
+        try:
+            all_values = sheet.get_all_values()
+            if len(all_values) > 1:  # Есть данные (не только заголовки)
+                headers = all_values[0]
+                sku_idx = headers.index("SKU")
+                stock_idx = headers.index("Current Stock")
+                action_idx = headers.index("Action Required")
+                status_idx = headers.index("Action Status")
+                
+                for row in all_values[1:]:  # Пропускаем заголовки
+                    if len(row) > max(sku_idx, stock_idx, action_idx, status_idx):
+                        sku = row[sku_idx].strip().upper()
+                        try:
+                            stock = int(row[stock_idx])
+                            prev_dict[sku] = stock
+                        except:
+                            pass
+                        
+                        # Сохраняем pending действия (где статус не DONE)
+                        action = row[action_idx]
+                        status = row[status_idx] if len(row) > status_idx else "PENDING"
+                        
+                        if action in ["REMOVE FROM STORE", "ADD TO STORE"] and status != "DONE":
+                            pending_actions_from_sheet[sku] = action
+        except Exception as e:
+            print(f"Note: Could not read previous state from sheet ({e})")
+    except:
+        pass
 
-# Собираем отчёт + определяем новые события
+# Собираем отчёт
 report = []
 new_out_of_stock = []
 new_restocked = []
@@ -108,10 +130,9 @@ for item in current:
     change = current_stock - prev_stock
     status = "RESTOCKED" if change > 0 else "SOLD" if change < 0 else "UNCHANGED"
     
-    # Определяем текущий алерт
+    # Определяем алерт
     if current_stock <= CRITICAL_STOCK:
         alert = "OUT OF STOCK"
-        # НОВОЕ условие: был сток >0, стал 0
         if prev_stock > CRITICAL_STOCK and current_stock == CRITICAL_STOCK:
             alert = "NEWLY OUT OF STOCK"
             new_out_of_stock.append(item)
@@ -119,32 +140,26 @@ for item in current:
         alert = "LOW STOCK"
     else:
         alert = "OK"
-        # Пополнение после нуля: был 0, стал >0
         if prev_stock == CRITICAL_STOCK and current_stock > CRITICAL_STOCK:
             alert = "RESTOCKED"
             new_restocked.append(item)
     
-    # Определяем действие (персистентное)
+    # Определяем действие
     action = "NO ACTION"
+    action_status = "DONE"
     
-    # Если есть активное действие из предыдущего запуска - сохраняем его
-    if sku in pending_actions:
-        action = pending_actions[sku]["action"]
+    # Если уже есть активное действие в таблице - сохраняем его
+    if sku in pending_actions_from_sheet:
+        action = pending_actions_from_sheet[sku]
+        action_status = "PENDING"
     else:
-        # Новое действие только в двух случаях
+        # Новое действие
         if alert == "NEWLY OUT OF STOCK":
-            action = "REMOVE FROM STORE"  # Нужно убрать товар из магазина
-            pending_actions[sku] = {
-                "action": "REMOVE FROM STORE",
-                "since": datetime.now().strftime("%Y-%m-%d %H:%M")
-            }
+            action = "REMOVE FROM STORE"
+            action_status = "PENDING"
         elif alert == "RESTOCKED":
-            action = "ADD TO STORE"  # Нужно добавить товар обратно в магазин
-            pending_actions[sku] = {
-                "action": "ADD TO STORE",
-                "since": datetime.now().strftime("%Y-%m-%d %H:%M")
-            }
-        # LOW STOCK и OK → NO ACTION
+            action = "ADD TO STORE"
+            action_status = "PENDING"
     
     report.append({
         "SKU": sku,
@@ -155,28 +170,20 @@ for item in current:
         "Status": status,
         "Alert Level": alert,
         "Action Required": action,
-        "Action Since": pending_actions[sku]["since"] if sku in pending_actions else "-",
+        "Action Status": action_status,
         "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
     })
 
-# Сохраняем состояние для завтра
+# Сохраняем состояние в файл (для резервной копии)
 with open("inventory_previous.csv", "w", encoding="utf-8") as f:
     f.write("sku,stock\n")
     for item in current:
         f.write(f"{item['sku']},{item['stock']}\n")
 
-# Сохраняем активные действия (только те, что ещё не выполнены)
-with open("pending_actions.csv", "w", encoding="utf-8") as f:
-    f.write("sku,action,timestamp\n")
-    for sku, data in pending_actions.items():
-        f.write(f"{sku},{data['action']},{data['since']}\n")
-
 print(f"\n✅ Inventory check complete")
 print(f"Total tracked: {len(current)}")
-print(f"Out of stock: {len([r for r in report if r['Alert Level'] == 'OUT OF STOCK'])}")
 print(f"Newly out of stock: {len(new_out_of_stock)}")
-print(f"Restocked (back from 0): {len(new_restocked)}")
-print(f"Low stock (<=3): {len([r for r in report if r['Alert Level'] == 'LOW STOCK'])}")
+print(f"Restocked: {len(new_restocked)}")
 
 # ОБНОВЛЯЕМ GOOGLE SHEETS
 if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
@@ -191,10 +198,13 @@ if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
         client = gspread.authorize(creds)
         sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
         
-        # Очищаем и пишем заголовки
+        # Полная очистка + сброс размера
         sheet.clear()
+        sheet.resize(rows=1)
+        
+        # Заголовки (включая "Last Updated")
         headers = ["SKU", "Product", "Current Stock", "Previous Stock", "Change", "Status", 
-                   "Alert Level", "Action Required", "Action Since", "Last Updated"]
+                   "Alert Level", "Action Required", "Action Status", "Last Updated"]
         sheet.append_row(headers)
         
         # Пишем данные
@@ -208,66 +218,30 @@ if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID:
                 row["Status"],
                 row["Alert Level"],
                 row["Action Required"],
-                row["Action Since"],
+                row["Action Status"],
                 row["Last Updated"]
             ])
         
         print(f"✓ Google Sheets updated ({len(report)} rows)")
         
-        # Показываем новые критические события
+        # Показываем новые события
         if new_out_of_stock:
-            print(f"\n⚠️ {len(new_out_of_stock)} NEWLY OUT OF STOCK items:")
+            print(f"\n⚠️ {len(new_out_of_stock)} NEWLY OUT OF STOCK:")
             for item in new_out_of_stock:
                 print(f"   - {item['sku']}: {item['name']} (stock: {item['stock']})")
         
         if new_restocked:
-            print(f"\n✅ {len(new_restocked)} RESTOCKED items (back from 0):")
+            print(f"\n✅ {len(new_restocked)} RESTOCKED:")
             for item in new_restocked:
                 print(f"   - {item['sku']}: {item['name']} (stock: {item['stock']})")
         
-        print("\nOpen your sheet → sort by 'Action Required' to see pending actions at top")
+        print("\n💡 HOW TO USE:")
+        print("1. Open your sheet → sort by 'Action Status' to see PENDING actions at top")
+        print("2. Do the action (remove/add product in your store)")
+        print("3. Change 'Action Status' from PENDING to DONE in the sheet")
+        print("4. Action will disappear from PENDING list on next run")
     
     except Exception as e:
         print(f"Google Sheets error: {e}")
 else:
-    print("WARNING: Google Sheets credentials not set — skipping sheet update")
-
-# ОТПРАВЛЯЕМ ПИСЬМО ПРИ НОВЫХ СОБЫТИЯХ
-if (new_out_of_stock or new_restocked) and BREVO_API_KEY and RECIPIENT_EMAILS:
-    subject = f"Inventory Alert - {len(new_out_of_stock)} out of stock, {len(new_restocked)} restocked"
-    body = ""
-    
-    if new_out_of_stock:
-        body += f"Products that just ran out of stock:\n\n"
-        for item in new_out_of_stock:
-            body += f"- SKU: {item['sku']} | {item['name']} | Stock: {item['stock']}\n"
-        body += "\n⚠️ Action required: REMOVE FROM STORE\n\n"
-    
-    if new_restocked:
-        body += f"Products that were restocked (back from 0):\n\n"
-        for item in new_restocked:
-            body += f"- SKU: {item['sku']} | {item['name']} | Stock: {item['stock']}\n"
-        body += "\n✅ Action required: ADD TO STORE\n\n"
-    
-    body += "See Google Sheets for details and pending actions"
-    
-    try:
-        import requests as req
-        response = req.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
-            json={
-                "sender": {"email": "alerts@bk-feed-check.com", "name": "BK Inventory Bot"},
-                "to": [{"email": email} for email in RECIPIENT_EMAILS],
-                "subject": subject,
-                "textContent": body
-            }
-        )
-        if response.status_code in [200, 201]:
-            print(f"✓ Email sent to {len(RECIPIENT_EMAILS)} recipients")
-        else:
-            print(f"Brevo failed: {response.status_code}")
-    except Exception as e:
-        print(f"Email error: {e}")
-elif not new_out_of_stock and not new_restocked:
-    print("No new critical events — skipping email")
+    print("WARNING: Google Sheets credentials not set")
