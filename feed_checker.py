@@ -1,4 +1,5 @@
 import requests
+import pandas as pd
 import re
 from datetime import datetime
 import os
@@ -6,17 +7,8 @@ import sys
 import json
 
 # ========== КОНФИГУРАЦИЯ ==========
-# Твои SKUs — просто вставь сюда (значения из тега <KOD> фида)
-MY_SKUS = [
-    "MI06",
-    "MR03S",
-    "UG70100",
-    # Добавляй сюда новые через запятую
-    # "SKU1",
-    # "SKU2",
-]
-
 FEED_URL = "https://b2b.dvedeti.cz/36365?password=36365"
+MY_SKUS_FILE = "my_skus.xlsx"  # Excel файл с колонкой "SKU"
 CRITICAL_STOCK = 0
 WARNING_STOCK = 3
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
@@ -55,14 +47,29 @@ for match in re.finditer(r'<SHOPITEM>(.*?)</SHOPITEM>', xml_str, re.DOTALL):
 
 print(f"Parsed {len(items)} products from feed")
 
+# Читаем SKUs из Excel файла
+if not os.path.exists(MY_SKUS_FILE):
+    print(f"MISSING: {MY_SKUS_FILE} not found")
+    print("Create Excel file with column 'SKU' and your product codes")
+    sys.exit(1)
+
+try:
+    my_skus_df = pd.read_excel(MY_SKUS_FILE)
+    MY_SKUS = my_skus_df["SKU"].astype(str).str.strip().str.upper().tolist()
+except Exception as e:
+    print(f"Error reading {MY_SKUS_FILE}: {e}")
+    sys.exit(1)
+
+print(f"Loaded {len(MY_SKUS)} SKUs from {MY_SKUS_FILE}")
+
 # Фильтруем только твои SKUs
-my_skus_set = set([s.upper() for s in MY_SKUS])
+my_skus_set = set(MY_SKUS)
 current = [i for i in items if i["sku"] in my_skus_set]
 
 if not current:
-    print("WARNING: No matching SKUs found")
+    print("WARNING: No matching SKUs found in feed")
     print(f"First 3 feed SKUs: {[i['sku'] for i in items[:3]]}")
-    print(f"Your SKUs: {MY_SKUS[:3]}")
+    print(f"Your SKUs (first 3): {MY_SKUS[:3]}")
     sys.exit(1)
 
 print(f"Tracking {len(current)} of your SKUs")
